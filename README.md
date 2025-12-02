@@ -40,22 +40,124 @@ Strapi gives you many possible deployment options for your project including [St
 yarn strapi deploy
 ```
 
-## 📚 Learn more
 
-- [Resource center](https://strapi.io/resource-center) - Strapi resource center.
-- [Strapi documentation](https://docs.strapi.io) - Official Strapi documentation.
-- [Strapi tutorials](https://strapi.io/tutorials) - List of tutorials made by the core team and the community.
-- [Strapi blog](https://strapi.io/blog) - Official Strapi blog containing articles made by the Strapi team and the community.
-- [Changelog](https://strapi.io/changelog) - Find out about the Strapi product updates, new features and general improvements.
-
-Feel free to check out the [Strapi GitHub repository](https://github.com/strapi/strapi). Your feedback and contributions are welcome!
-
-## ✨ Community
-
-- [Discord](https://discord.strapi.io) - Come chat with the Strapi community including the core team.
-- [Forum](https://forum.strapi.io/) - Place to discuss, ask questions and find answers, show your Strapi project and get feedback or just talk with other Community members.
-- [Awesome Strapi](https://github.com/strapi/awesome-strapi) - A curated list of awesome things related to Strapi.
+# 🐟 Telegram Fish Shop Bot + Strapi CMS  
+Полноценный Telegram-бот-магазин с корзиной, товарами, оплатой (заявкой) и интеграцией с локальной Strapi CMS.  
+Решение выполнено в рамках учебного проекта Devman — «Продаём рыбу в Telegram».
 
 ---
 
-<sub>🤫 Psst! [Strapi is hiring](https://strapi.io/careers).</sub>
+## 🚀 Функционал бота
+
+### 📦 Каталог товаров
+- загрузка товаров из Strapi через REST API  
+- отображение списка товаров  
+- карточка товара с:
+  - названием  
+  - описанием  
+  - ценой  
+  - фото  
+  - кнопкой «Добавить в корзину»
+
+### 🧺 Корзина
+- создание корзины на основе Telegram ID  
+- добавление товаров с учётом веса, указанного в CMS  
+- корректный суммарный расчёт  
+- отображение всех позиций  
+- удаление позиций (DELETE /cart-items/:id)  
+- кнопка «В меню»
+
+### 💳 Оформление заказа
+- кнопка «Оплатить»  
+- бот запрашивает email  
+- email сохраняется в модели Clients в Strapi  
+- дальнейшее общение происходит оффлайн
+
+---
+
+## ⚙️ Установка проекта
+
+### 1️⃣ Установить зависимости Strapi
+```bash
+npm install
+```
+
+### 2️⃣ Запустить Strapi CMS
+```bash
+npm run develop
+```
+
+Strapi запустится по адресу:
+```
+http://localhost:1337/admin
+```
+
+---
+
+## 🤖 Запуск Telegram-бота
+
+### Переменные окружения
+Создай файл `.env`:
+
+```
+TELEGRAM_TOKEN=твой_токен
+STRAPI_URL=http://localhost:1337
+```
+
+### Установка Python-зависимостей
+```bash
+pip install -r requirements.txt
+```
+
+### Запуск бота
+```bash
+python tg_bot.py
+```
+
+---
+
+## 🔗 Используемые REST-ендпоинты
+
+### 📄 Товары
+```
+GET /api/products?populate=*
+GET /api/products?filters[id][$eq]=ID&populate=*
+```
+
+### 🧺 Корзина
+```
+GET /api/carts?filters[tg_id][$eq]=ID
+POST /api/carts
+```
+
+### 🛒 Позиции корзины
+```
+GET /api/cart-items?filters[cart][id][$eq]=ID&populate=product
+POST /api/cart-items
+PUT /api/cart-items/:id
+DELETE /api/cart-items/:id
+```
+
+### 👤 Клиенты
+```
+GET /api/clients?filters[tg_id][$eq]=ID
+POST /api/clients
+PUT /api/clients/:id
+```
+
+---
+
+## 🎯 Итог
+Бот реализует полный Devman-MVP:
+- каталог ✔️  
+- карточки ✔️  
+- корзина ✔️  
+- удаление ✔️  
+- ввод email ✔️  
+- сохранение в CMS ✔️  
+
+---
+
+## 📬 Контакты
+Если будут вопросы — пиши 😊
+```
