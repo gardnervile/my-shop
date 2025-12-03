@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 from io import BytesIO
@@ -6,6 +5,7 @@ from urllib.parse import urljoin
 
 import redis
 import requests
+from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     CallbackQueryHandler,
@@ -16,14 +16,9 @@ from telegram.ext import (
 )
 
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _database = None
-
-STRAPI_URL = "http://localhost:1337"
-STRAPI_API_TOKEN = None
-TELEGRAM_TOKEN = None
 
 CART_TG_FIELD = "tg_id"
 
@@ -34,99 +29,275 @@ STATE_HANDLE_CART = "HANDLE_CART"
 STATE_WAITING_EMAIL = "WAITING_EMAIL"
 
 
-def load_env_config():
-    global STRAPI_URL, STRAPI_API_TOKEN, TELEGRAM_TOKEN
-    STRAPI_URL = os.getenv("STRAPI_URL", "http://localhost:1337")
-    STRAPI_API_TOKEN = os.getenv("STRAPI_API_TOKEN")
-    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("Переменная окружения TELEGRAM_TOKEN не задана")
+class StrapiClient:
+    def __init__(self, base_url: str, api_token: str | None = None):
+        self.base_url = base_url
+        self.api_token = api_token
 
+    def _make_headers(self, is_json: bool = False):
+        headers = {"Accept": "application/json"}
+        if is_json:
+            headers["Content-Type"] = "application/json"
+        if self.api_token:
+            headers["Authorization"] = f"Bearer {self.api_token}"
+        return headers
 
-def _make_headers(is_json: bool = False):
-    headers = {"Accept": "application/json"}
-    if is_json:
-        headers["Content-Type"] = "application/json"
-    if STRAPI_API_TOKEN:
-        headers["Authorization"] = f"Bearer {STRAPI_API_TOKEN}"
-    return headers
+    def fetch_products(self):
+        url = f"{self.base_url}/api/products"
+        params = {"populate": "*"}
+        try:
+            response = requests.get(
+                url,
+                headers=self._make_headers(),
+                params=params,
+                timeout=8,
+            )
+            response.raise_for_status()
+            return response.json().get("data") or []
+        except Exception as exc:
+            logger.error("Ошибка при запросе товаров: %s", exc)
+            return []
 
+    def get_product_by_id(self, product_id: int):
+        url = f"{self.base_url}/api/products"
+        params = {
+            "filters[id][$eq]": product_id,
+            "populate": "*",
+        }
+        try:
+            response = requests.get(
+                url,
+                headers=self._make_headers(),
+                params=params,
+                timeout=8,
+            )
+            response.raise_for_status()
+            product_records = response.json().get("data") or []
+            if not product_records:
+                logger.error("Товар %s не найден", product_id)
+                return None
 
-def _resolve_media_url(url_value: str) -> str:
-    if not url_value:
-        return ""
-    if url_value.startswith(("http://", "https://")):
-        return url_value
-    return urljoin(STRAPI_URL, url_value)
+            product_data = product_records[0]
+            title = product_data.get("title") or f"Товар #{product_id}"
+            description = product_data.get("description") or ""
+            price = product_data.get("price") or 0
+            qty_kg = product_data.get("qty_kg")
 
+            picture = product_data.get("picture") or {}
+            img_url = None
+            if isinstance(picture, dict):
+                img_url = picture.get("url")
+                formats = picture.get("formats") or {}
+                medium = formats.get("medium") or formats.get("small")
+                if medium and medium.get("url"):
+                    img_url = medium["url"]
+            if img_url:
+                image_url = (
+                    img_url
+                    if img_url.startswith(("http://", "https://"))
+                    else urljoin(self.base_url, img_url)
+                )
+            else:
+                image_url = ""
 
-def fetch_products():
-    url = f"{STRAPI_URL}/api/products"
-    params = {"populate": "*"}
-    try:
-        response = requests.get(
-            url,
-            headers=_make_headers(),
-            params=params,
-            timeout=8,
-        )
-        response.raise_for_status()
-        return response.json().get("data") or []
-    except Exception as exc:
-        logger.error("Ошибка при запросе товаров: %s", exc)
-        return []
-
-
-def get_product_by_id(product_id: int):
-    url = f"{STRAPI_URL}/api/products"
-    params = {
-        "filters[id][$eq]": product_id,
-        "populate": "*",
-    }
-    try:
-        response = requests.get(
-            url,
-            headers=_make_headers(),
-            params=params,
-            timeout=8,
-        )
-        response.raise_for_status()
-        product_records = response.json().get("data") or []
-        if not product_records:
-            logger.error("Товар %s не найден", product_id)
+            return {
+                "id": product_data.get("id", product_id),
+                "title": title,
+                "description": description,
+                "price": price,
+                "image_url": image_url,
+                "qty_kg": qty_kg,
+            }
+        except Exception as exc:
+            logger.error("Ошибка при запросе товара %s: %s", product_id, exc)
             return None
 
-        product_data = product_records[0]
-        title = product_data.get("title") or f"Товар #{product_id}"
-        description = product_data.get("description") or ""
-        price = product_data.get("price") or 0
-        qty_kg = product_data.get("qty_kg")
+    def get_cart_by_tg(self, tg_id: str):
+        params = {f"filters[{CART_TG_FIELD}][$eq]": str(tg_id)}
+        url = f"{self.base_url}/api/carts"
+        response = requests.get(url, headers=self._make_headers(), params=params, timeout=8)
+        if response.status_code >= 400:
+            logger.error("Cart get error: %s", response.text)
+        response.raise_for_status()
+        carts = response.json().get("data") or []
+        return carts[0] if carts else None
 
-        picture = product_data.get("picture") or {}
-        img_url = None
-        if isinstance(picture, dict):
-            img_url = picture.get("url")
-            formats = picture.get("formats") or {}
-            medium = formats.get("medium") or formats.get("small")
-            if medium and medium.get("url"):
-                img_url = medium["url"]
-        image_url = _resolve_media_url(img_url) if img_url else ""
+    def create_cart_for_tg(self, tg_id: str):
+        payload = {"data": {CART_TG_FIELD: str(tg_id)}}
+        url = f"{self.base_url}/api/carts"
+        response = requests.post(
+            url,
+            headers=self._make_headers(is_json=True),
+            json=payload,
+            timeout=8,
+        )
+        if response.status_code >= 400:
+            logger.error("Cart create error: %s", response.text)
+        response.raise_for_status()
+        return response.json().get("data")
 
-        return {
-            "id": product_data.get("id", product_id),
-            "title": title,
-            "description": description,
-            "price": price,
-            "image_url": image_url,
-            "qty_kg": qty_kg,
+    def ensure_cart_exists(self, tg_id: str):
+        cart = self.get_cart_by_tg(tg_id)
+        if cart:
+            return cart
+        return self.create_cart_for_tg(tg_id)
+
+    def find_cart_item(self, cart_id: int, product_id: int):
+        params = {
+            "filters[cart][id][$eq]": cart_id,
+            "filters[product][id][$eq]": product_id,
         }
-    except Exception as exc:
-        logger.error("Ошибка при запросе товара %s: %s", product_id, exc)
-        return None
+        url = f"{self.base_url}/api/cart-items"
+        response = requests.get(url, headers=self._make_headers(), params=params, timeout=8)
+        if response.status_code >= 400:
+            logger.error("CartItem find error: %s", response.text)
+        response.raise_for_status()
+        cart_items = response.json().get("data") or []
+        return cart_items[0] if cart_items else None
+
+    def create_cart_item(self, cart_id: int, product_id: int, qty_kg: float):
+        payload = {
+            "data": {
+                "cart": cart_id,
+                "product": product_id,
+                "qty_kg": float(qty_kg),
+            }
+        }
+        url = f"{self.base_url}/api/cart-items"
+        response = requests.post(
+            url,
+            headers=self._make_headers(is_json=True),
+            json=payload,
+            timeout=8,
+        )
+        if response.status_code >= 400:
+            logger.error("CartItem create error: %s", response.text)
+        response.raise_for_status()
+        return response.json().get("data")
+
+    def update_cart_item_qty(self, item_id, qty_kg: float, suppress_not_found: bool = False):
+        payload = {"data": {"qty_kg": float(qty_kg)}}
+        url = f"{self.base_url}/api/cart-items/{item_id}"
+        response = requests.put(
+            url,
+            headers=self._make_headers(is_json=True),
+            json=payload,
+            timeout=8,
+        )
+        if response.status_code == 404:
+            if not suppress_not_found:
+                logger.warning(
+                    "CartItem %s not found on update: %s",
+                    item_id,
+                    response.text,
+                )
+            return None
+        if response.status_code >= 400:
+            logger.error("CartItem update error: %s", response.text)
+            response.raise_for_status()
+        return response.json().get("data")
+
+    def add_or_increment_item(self, cart_id: int, product_id: int, qty_to_add: float):
+        existing = self.find_cart_item(cart_id, product_id)
+        if existing is None:
+            return self.create_cart_item(cart_id, product_id, qty_to_add)
+
+        item_id = get_cart_item_identifier(existing)
+        current_qty = existing.get("qty_kg") or 0
+        new_qty = float(current_qty) + float(qty_to_add)
+
+        updated = self.update_cart_item_qty(item_id, new_qty)
+        if updated is None:
+            return self.create_cart_item(cart_id, product_id, new_qty)
+        return updated
+
+    def delete_cart_item(self, item_id):
+        url = f"{self.base_url}/api/cart-items/{item_id}"
+        response = requests.delete(url, headers=self._make_headers(is_json=True), timeout=8)
+        if response.status_code == 404:
+            logger.warning("CartItem %s not found on delete: %s", item_id, response.text)
+            return False
+        if response.status_code >= 400:
+            logger.error("CartItem delete error: %s", response.text)
+            response.raise_for_status()
+        return True
+
+    def hide_cart_item(self, item_id):
+        updated = self.update_cart_item_qty(item_id, 0, suppress_not_found=True)
+        return updated is not None
+
+    def get_cart_items_with_products(self, cart_id: int):
+        params = {
+            "filters[cart][id][$eq]": cart_id,
+            "populate": "product",
+        }
+        url = f"{self.base_url}/api/cart-items"
+        response = requests.get(url, headers=self._make_headers(), params=params, timeout=8)
+        if response.status_code >= 400:
+            logger.error("Cart items get error: %s", response.text)
+        response.raise_for_status()
+        return response.json().get("data") or []
+
+    def find_client_by_tg(self, tg_id: str):
+        url = f"{self.base_url}/api/clients"
+        params = {
+            "filters[tg_id][$eq]": str(tg_id),
+        }
+        response = requests.get(url, headers=self._make_headers(), params=params, timeout=8)
+        if response.status_code >= 400:
+            logger.error("Client find error: %s", response.text)
+        response.raise_for_status()
+        clients = response.json().get("data") or []
+        return clients[0] if clients else None
+
+    def create_client(self, tg_id: str, email: str):
+        url = f"{self.base_url}/api/clients"
+        payload = {
+            "data": {
+                "tg_id": str(tg_id),
+                "email": email,
+            }
+        }
+        response = requests.post(
+            url,
+            headers=self._make_headers(is_json=True),
+            json=payload,
+            timeout=8,
+        )
+        if response.status_code >= 400:
+            logger.error("Client create error: %s", response.text)
+        response.raise_for_status()
+        return response.json().get("data")
+
+    def update_client(self, client_id: int, email: str):
+        url = f"{self.base_url}/api/clients/{client_id}"
+        payload = {
+            "data": {
+                "email": email,
+            }
+        }
+        response = requests.put(
+            url,
+            headers=self._make_headers(is_json=True),
+            json=payload,
+            timeout=8,
+        )
+        if response.status_code >= 400:
+            logger.error("Client update error: %s", response.text)
+        response.raise_for_status()
+        return response.json().get("data")
+
+    def create_or_update_client(self, tg_id: str, email: str):
+        existing = self.find_client_by_tg(tg_id)
+        if existing:
+            cid = existing.get("id")
+            if cid:
+                return self.update_client(cid, email)
+        return self.create_client(tg_id, email)
 
 
-def build_products_keyboard():
-    products = fetch_products()
+def build_products_keyboard(strapi_client: StrapiClient):
+    products = strapi_client.fetch_products()
     if not products:
         return InlineKeyboardMarkup(
             [
@@ -157,210 +328,13 @@ def build_products_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_cart_by_tg(tg_id: str):
-    params = {f"filters[{CART_TG_FIELD}][$eq]": str(tg_id)}
-    url = f"{STRAPI_URL}/api/carts"
-    response = requests.get(url, headers=_make_headers(), params=params, timeout=8)
-    if response.status_code >= 400:
-        logger.error("Cart get error: %s", response.text)
-    response.raise_for_status()
-    carts = response.json().get("data") or []
-    return carts[0] if carts else None
-
-
-def create_cart_for_tg(tg_id: str):
-    payload = {"data": {CART_TG_FIELD: str(tg_id)}}
-    url = f"{STRAPI_URL}/api/carts"
-    response = requests.post(
-        url,
-        headers=_make_headers(is_json=True),
-        json=payload,
-        timeout=8,
-    )
-    if response.status_code >= 400:
-        logger.error("Cart create error: %s", response.text)
-    response.raise_for_status()
-    return response.json().get("data")
-
-
-def ensure_cart_exists(tg_id: str):
-    cart = get_cart_by_tg(tg_id)
-    if cart:
-        return cart
-    return create_cart_for_tg(tg_id)
-
-
-def find_cart_item(cart_id: int, product_id: int):
-    params = {
-        "filters[cart][id][$eq]": cart_id,
-        "filters[product][id][$eq]": product_id,
-    }
-    url = f"{STRAPI_URL}/api/cart-items"
-    response = requests.get(url, headers=_make_headers(), params=params, timeout=8)
-    if response.status_code >= 400:
-        logger.error("CartItem find error: %s", response.text)
-    response.raise_for_status()
-    cart_items = response.json().get("data") or []
-    return cart_items[0] if cart_items else None
-
-
 def get_cart_item_identifier(cart_item: dict):
     return cart_item.get("documentId") or cart_item.get("id")
 
 
-def create_cart_item(cart_id: int, product_id: int, qty_kg: float):
-    payload = {
-        "data": {
-            "cart": cart_id,
-            "product": product_id,
-            "qty_kg": float(qty_kg),
-        }
-    }
-    url = f"{STRAPI_URL}/api/cart-items"
-    response = requests.post(
-        url,
-        headers=_make_headers(is_json=True),
-        json=payload,
-        timeout=8,
-    )
-    if response.status_code >= 400:
-        logger.error("CartItem create error: %s", response.text)
-    response.raise_for_status()
-    return response.json().get("data")
-
-
-def update_cart_item_qty(item_id, qty_kg: float, suppress_not_found: bool = False):
-    payload = {"data": {"qty_kg": float(qty_kg)}}
-    url = f"{STRAPI_URL}/api/cart-items/{item_id}"
-    response = requests.put(
-        url,
-        headers=_make_headers(is_json=True),
-        json=payload,
-        timeout=8,
-    )
-    if response.status_code == 404:
-        if not suppress_not_found:
-            logger.warning(
-                "CartItem %s not found on update: %s",
-                item_id,
-                response.text,
-            )
-        return None
-    if response.status_code >= 400:
-        logger.error("CartItem update error: %s", response.text)
-        response.raise_for_status()
-    return response.json().get("data")
-
-
-def add_or_increment_item(cart_id: int, product_id: int, qty_to_add: float):
-    existing = find_cart_item(cart_id, product_id)
-    if not existing:
-        return create_cart_item(cart_id, product_id, qty_to_add)
-
-    item_id = get_cart_item_identifier(existing)
-    current_qty = existing.get("qty_kg") or 0
-    new_qty = float(current_qty) + float(qty_to_add)
-
-    updated = update_cart_item_qty(item_id, new_qty)
-    if updated is None:
-        return create_cart_item(cart_id, product_id, new_qty)
-    return updated
-
-
-def delete_cart_item(item_id):
-    url = f"{STRAPI_URL}/api/cart-items/{item_id}"
-    response = requests.delete(url, headers=_make_headers(is_json=True), timeout=8)
-    if response.status_code == 404:
-        logger.warning("CartItem %s not found on delete: %s", item_id, response.text)
-        return False
-    if response.status_code >= 400:
-        logger.error("CartItem delete error: %s", response.text)
-        response.raise_for_status()
-    return True
-
-
-def hide_cart_item(item_id):
-    updated = update_cart_item_qty(item_id, 0, suppress_not_found=True)
-    return updated is not None
-
-
-def get_cart_items_with_products(cart_id: int):
-    params = {
-        "filters[cart][id][$eq]": cart_id,
-        "populate": "product",
-    }
-    url = f"{STRAPI_URL}/api/cart-items"
-    response = requests.get(url, headers=_make_headers(), params=params, timeout=8)
-    if response.status_code >= 400:
-        logger.error("Cart items get error: %s", response.text)
-    response.raise_for_status()
-    return response.json().get("data") or []
-
-
-# ====================== Clients (шаг 19) ======================
-def find_client_by_tg(tg_id: str):
-    url = f"{STRAPI_URL}/api/clients"
-    params = {
-        "filters[tg_id][$eq]": str(tg_id),
-    }
-    response = requests.get(url, headers=_make_headers(), params=params, timeout=8)
-    if response.status_code >= 400:
-        logger.error("Client find error: %s", response.text)
-    response.raise_for_status()
-    clients = response.json().get("data") or []
-    return clients[0] if clients else None
-
-
-def create_client(tg_id: str, email: str):
-    url = f"{STRAPI_URL}/api/clients"
-    payload = {
-        "data": {
-            "tg_id": str(tg_id),
-            "email": email,
-        }
-    }
-    response = requests.post(
-        url,
-        headers=_make_headers(is_json=True),
-        json=payload,
-        timeout=8,
-    )
-    if response.status_code >= 400:
-        logger.error("Client create error: %s", response.text)
-    response.raise_for_status()
-    return response.json().get("data")
-
-
-def update_client(client_id: int, email: str):
-    url = f"{STRAPI_URL}/api/clients/{client_id}"
-    payload = {
-        "data": {
-            "email": email,
-        }
-    }
-    response = requests.put(
-        url,
-        headers=_make_headers(is_json=True),
-        json=payload,
-        timeout=8,
-    )
-    if response.status_code >= 400:
-        logger.error("Client update error: %s", response.text)
-    response.raise_for_status()
-    return response.json().get("data")
-
-
-def create_or_update_client(tg_id: str, email: str):
-    existing = find_client_by_tg(tg_id)
-    if existing:
-        cid = existing.get("id")
-        if cid:
-            return update_client(cid, email)
-    return create_client(tg_id, email)
-
-
 def start(update, context):
-    keyboard = build_products_keyboard()
+    strapi_client: StrapiClient = context.bot_data["strapi_client"]
+    keyboard = build_products_keyboard(strapi_client)
     if update.message:
         sent = update.message.reply_text(
             "Привет! Выбери рыбу из меню:",
@@ -376,6 +350,7 @@ def start(update, context):
 
 
 def handle_menu(update, context):
+    strapi_client: StrapiClient = context.bot_data["strapi_client"]
     if update.callback_query is None:
         if update.message:
             update.message.reply_text("Нажми /start, чтобы увидеть меню.")
@@ -391,7 +366,7 @@ def handle_menu(update, context):
         return STATE_START
 
     if callback_data == "show_cart":
-        return show_cart(update, context)
+        return show_cart(update, context, strapi_client)
 
     try:
         product_id = int(callback_data)
@@ -399,7 +374,7 @@ def handle_menu(update, context):
         query.message.reply_text("Не понял, какой товар выбран 🤔")
         return STATE_HANDLE_MENU
 
-    product = get_product_by_id(product_id)
+    product = strapi_client.get_product_by_id(product_id)
     if not product:
         query.message.reply_text("Не удалось получить данные о товаре.")
         return STATE_HANDLE_MENU
@@ -466,6 +441,7 @@ def handle_menu(update, context):
 
 
 def handle_description(update, context):
+    strapi_client: StrapiClient = context.bot_data["strapi_client"]
     if update.callback_query is None:
         if update.message:
             update.message.reply_text(
@@ -485,7 +461,7 @@ def handle_description(update, context):
                 context.bot.delete_message(chat_id=chat_id, message_id=card_id)
             except Exception as exc:
                 logger.info("Не удалось удалить карточку: %s", exc)
-        keyboard = build_products_keyboard()
+        keyboard = build_products_keyboard(strapi_client)
         sent = context.bot.send_message(
             chat_id=chat_id,
             text="Выбери рыбу из меню:",
@@ -495,7 +471,7 @@ def handle_description(update, context):
         return STATE_HANDLE_MENU
 
     if callback_data == "show_cart":
-        return show_cart(update, context)
+        return show_cart(update, context, strapi_client)
 
     if callback_data.startswith("add_"):
         try:
@@ -504,7 +480,7 @@ def handle_description(update, context):
             query.message.reply_text("Не понял, что добавить 🤔")
             return STATE_HANDLE_DESCRIPTION
 
-        product = get_product_by_id(product_id)
+        product = strapi_client.get_product_by_id(product_id)
         if not product:
             query.message.reply_text("Товар больше не доступен 😢")
             return STATE_HANDLE_DESCRIPTION
@@ -512,9 +488,9 @@ def handle_description(update, context):
         qty_val = float(product.get("qty_kg") or 1)
 
         try:
-            cart = ensure_cart_exists(str(chat_id))
+            cart = strapi_client.ensure_cart_exists(str(chat_id))
             cart_id = cart.get("id")
-            add_or_increment_item(cart_id, product_id, qty_val)
+            strapi_client.add_or_increment_item(cart_id, product_id, qty_val)
             query.message.reply_text(
                 f"Товар #{product_id}: +{qty_val} кг добавлено в корзину."
             )
@@ -529,7 +505,7 @@ def handle_description(update, context):
     return STATE_HANDLE_DESCRIPTION
 
 
-def show_cart(update, context, replace_message: bool = False):
+def show_cart(update, context, strapi_client: StrapiClient, replace_message: bool = False):
     if update.callback_query:
         query = update.callback_query
         chat_id = query.message.chat_id
@@ -563,7 +539,7 @@ def show_cart(update, context, replace_message: bool = False):
                 reply_markup=keyboard,
             )
 
-    cart = get_cart_by_tg(str(chat_id))
+    cart = strapi_client.get_cart_by_tg(str(chat_id))
     if not cart:
         text = "🧺 Ваша корзина пока пуста."
         keyboard = InlineKeyboardMarkup(
@@ -573,7 +549,7 @@ def show_cart(update, context, replace_message: bool = False):
         return STATE_HANDLE_CART
 
     cart_id = cart.get("id")
-    cart_items_raw = get_cart_items_with_products(cart_id)
+    cart_items_raw = strapi_client.get_cart_items_with_products(cart_id)
     logger.info(
         "show_cart chat=%s cart_id=%s items=%s",
         chat_id,
@@ -636,6 +612,7 @@ def show_cart(update, context, replace_message: bool = False):
 
 
 def handle_cart(update, context):
+    strapi_client: StrapiClient = context.bot_data["strapi_client"]
     if update.callback_query is None:
         if update.message:
             update.message.reply_text("Используй кнопки внизу корзины.")
@@ -647,7 +624,7 @@ def handle_cart(update, context):
     chat_id = query.message.chat_id
 
     if callback_data == "back_to_menu":
-        keyboard = build_products_keyboard()
+        keyboard = build_products_keyboard(strapi_client)
         sent = context.bot.send_message(
             chat_id=chat_id,
             text="Выбери рыбу из меню:",
@@ -664,8 +641,8 @@ def handle_cart(update, context):
         item_id = callback_data.rsplit("_", 1)[1]
 
         try:
-            deleted = delete_cart_item(item_id)
-            soft_deleted = hide_cart_item(item_id)
+            deleted = strapi_client.delete_cart_item(item_id)
+            soft_deleted = strapi_client.hide_cart_item(item_id)
 
             if deleted or soft_deleted:
                 query.message.reply_text("Товар удалён из корзины ✅")
@@ -677,12 +654,13 @@ def handle_cart(update, context):
                 "Не удалось удалить товар, попробуй ещё раз позже."
             )
 
-        return show_cart(update, context, replace_message=True)
+        return show_cart(update, context, strapi_client, replace_message=True)
 
     return STATE_HANDLE_CART
 
 
 def handle_waiting_email(update, context):
+    strapi_client: StrapiClient = context.bot_data["strapi_client"]
     if update.callback_query:
         query = update.callback_query
         query.answer()
@@ -704,7 +682,7 @@ def handle_waiting_email(update, context):
         return STATE_WAITING_EMAIL
 
     try:
-        create_or_update_client(chat_id, email)
+        strapi_client.create_or_update_client(chat_id, email)
     except Exception:
         logger.exception("Не удалось сохранить клиента в CMS")
 
@@ -712,7 +690,7 @@ def handle_waiting_email(update, context):
 
     update.message.reply_text(f"Спасибо! Мы записали вашу почту: {email}")
 
-    keyboard = build_products_keyboard()
+    keyboard = build_products_keyboard(strapi_client)
     sent = update.message.reply_text(
         "Можешь продолжить покупки:",
         reply_markup=keyboard,
@@ -772,12 +750,20 @@ def handle_users_reply(update, context):
         db.set(chat_id, STATE_START)
 
 
-if __name__ == "__main__":
-    load_env_config()
-    logger.info("Bot starting… STRAPI_URL=%s", STRAPI_URL)
+def main():
+    logging.basicConfig(level=logging.INFO)
+    load_dotenv()
+    strapi_url = os.getenv("STRAPI_URL", "http://localhost:1337")
+    strapi_api_token = os.getenv("STRAPI_API_TOKEN")
+    telegram_token = os.getenv("TELEGRAM_TOKEN")
+    if not telegram_token:
+        raise RuntimeError("Переменная окружения TELEGRAM_TOKEN не задана")
+    strapi_client = StrapiClient(strapi_url, strapi_api_token)
+    logger.info("Bot starting… STRAPI_URL=%s", strapi_url)
 
-    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
+    updater = Updater(token=telegram_token, use_context=True)
     dispatcher = updater.dispatcher
+    dispatcher.bot_data["strapi_client"] = strapi_client
 
     dispatcher.add_handler(CommandHandler("start", handle_users_reply))
     dispatcher.add_handler(CallbackQueryHandler(handle_users_reply))
@@ -790,3 +776,7 @@ if __name__ == "__main__":
 
     updater.start_polling()
     updater.idle()
+
+
+if __name__ == "__main__":
+    main()
